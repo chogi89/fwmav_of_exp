@@ -1,0 +1,3 @@
+<launch>
+    <node name="off_board_camera_test" pkg="fwmav_of_exp" type="off_board_camera_test" output="screen"/>
+</launch>

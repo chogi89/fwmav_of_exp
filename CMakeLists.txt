@@ -19,3 +19,7 @@ include_directories(include ${catkin_INCLUDE_DIRS})
 add_executable(off_board_camera_test src/off_board_camera_test.cpp)
 target_link_libraries(off_board_camera_test ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
 add_dependencies(off_board_camera_test fwmav_of_exp_generate_messages_cpp)
+
+add_executable(fwmav_exp_avc src/fwmav_exp_avc.cpp)
+target_link_libraries(fwmav_exp_avc ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
+add_dependencies(fwmav_exp_avc fwmav_of_exp_generate_messages_cpp)

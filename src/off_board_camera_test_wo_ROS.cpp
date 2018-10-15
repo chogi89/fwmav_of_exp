@@ -1,12 +1,3 @@
-#include "ros/ros.h"
-#include "fwmav_of_exp/MSG_NodeTime.h"
-
-#include <cv_bridge/cv_bridge.h>
-#include <image_transport/image_transport.h>
-#include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/TwistStamped.h>
-#include <gazebo_msgs/ModelStates.h>
-#include <sensor_msgs/Image.h>
 #include <opencv2/video/tracking.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -18,6 +9,12 @@
 #include <fstream>
 #include <ctype.h>
 #include <math.h>
+#include <iomanip>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include "opencv2/imgproc/imgproc_c.h"
+
 
 #define S_TIME      0.1
 
@@ -34,11 +31,25 @@
 #define WIDTH_H     80
 #define HEIGHT_H    12
 
-#define WIDTH_V     16
-#define HEIGHT_V    60
-
 #define HEIGHT_H_O  24
 #define WIDTH_V_O   32
+
+#define D_SET       0.1
+
+#define RL_P_GAIN   0.01
+#define RL_D_GAIN   0.01
+#define EPS_P_GAIN  1000
+#define ETA_P_GAIN  0.8
+#define ETA_D_GAIN  0
+
+#define SIGMA_C_ETA 2.5
+#define SIGMA_C_RL  2.5
+
+#define SIGMA_M_ETA 20
+#define SIGMA_M_RL  20
+
+#define CO_FRQ_RL   0.5
+#define CO_FRQ_ETA  5
 
 using namespace cv;
 using namespace std;
@@ -53,7 +64,11 @@ unsigned char Img_data[O_WIDTH*O_HEIGHT*3];
 // -- General Functions -- //
 // ----------------------- //
 
-// Enter the general functions here...
+double LPF(double y_p, double x_n, double tau);
+double Saturation(double val, double sat);
+double Sign(double val);
+double PD_controller(double &error_c, double &error_p, double P_gain, double D_gain);
+double Sigmoid_fnc(double sigma_m, double sigma_c, double val, int sgn);
 
 // ------------------------ //
 // -- Callback Functions -- //
@@ -66,17 +81,7 @@ unsigned char Img_data[O_WIDTH*O_HEIGHT*3];
 // ------------------- //
 
 int main (int argc, char **argv){
-    ros::init(argc, argv, "off_board_camer_test");
-    ros::NodeHandle nh, nh_mavros, nh_image;
-
-    ros::Publisher oa_of_pub = nh.advertise<fwmav_of_exp::MSG_NodeTime>("node_time",100);
-
-    ros::Rate loop_rate(1/S_TIME);
-
-    ofstream file_image_data("image_data.txt");
-
     Mat mat_arrow_h(Size(WIDTH_H*100, HEIGHT_H*100),CV_8UC1,255);
-    Mat mat_arrow_v(Size(WIDTH_V*100, HEIGHT_V*100),CV_8UC1,255);
     Mat mat_original;
     Mat mat_grey;
     Mat mat_resized;
@@ -85,14 +90,13 @@ int main (int argc, char **argv){
 
     char keypressed;
 
-    uchar arr_gray_prev[WIDTH][HEIGHT];
-    uchar arr_gray_curr[WIDTH][HEIGHT];
+    // ----------------------------- //
+    // -- Optical Flow Estimation -- //
+    // ----------------------------- //
 
+    uchar arr_gray_curr[WIDTH][HEIGHT];
     uchar arr_gray_prev_h[WIDTH_H][HEIGHT_H];
     uchar arr_gray_curr_h[WIDTH_H][HEIGHT_H];
-
-    uchar arr_gray_prev_v[WIDTH_V][HEIGHT_V];
-    uchar arr_gray_curr_v[WIDTH_V][HEIGHT_V];
 
     double Ix_h[WIDTH_H-1][HEIGHT_H-1];
     double Iy_h[WIDTH_H-1][HEIGHT_H-1];
@@ -107,18 +111,42 @@ int main (int argc, char **argv){
     CvPoint p1_h[WIDTH_H][HEIGHT_H];
     CvPoint p2_h[WIDTH_H][HEIGHT_H];
 
-    double Ix_v[WIDTH_V-1][HEIGHT_V-1];
-    double Iy_v[WIDTH_H-1][HEIGHT_V-1];
-    double It_v[WIDTH_V-1][HEIGHT_V-1];
+    double r_x_h[WIDTH_H][HEIGHT_H];
+    double r_y_h[WIDTH_H][HEIGHT_H];
+    double r_h[WIDTH_H][HEIGHT_H];
 
-    double u_v[WIDTH_V][HEIGHT_V];
-    double v_v[WIDTH_V][HEIGHT_V];
+    double eta_h[WIDTH_H][HEIGHT_H];
 
-    double mu_u_v[WIDTH_V-1][HEIGHT_V-1];
-    double mu_v_v[WIDTH_V-1][HEIGHT_V-1];
+    // -------------------------------------- //
+    // -- Obstacle Avoidance Guidance Rule -- //
+    // -------------------------------------- //
 
-    CvPoint p1_v[WIDTH_V][HEIGHT_V];
-    CvPoint p2_v[WIDTH_V][HEIGHT_V];
+    double OFright = 0;
+    double OFleft = 0;
+
+    double of_rl_e = 0;
+    double of_rl_e_f = 0;
+    double of_rl_e_f_p = 0;
+    double of_rl_ctrl_input = 0;
+
+    double eta_h_r = 0;
+    double eta_h_l = 0;
+    double eta_h_r_f = 0;
+    double eta_h_l_f = 0;
+    double eta_h_sum = 0;
+    double eta_h_sum_f = 0;
+    double eta_h_sum_f_p = 0;
+    double eta_h_e = 0;
+    double eta_h_ctrl_input = 0;
+    double eta_h_ctrl_signed_input = 0;
+
+    double sigmoid_eta = 0;
+    double sigmoid_rl = 0;
+
+    double d_vel_lx = 0;    // Desired linear velocity to x direction
+    double d_vel_ly = 0;    // Desired linear velocity to y direction
+    double d_vel_lz = 0;    // Desired linear velocity to z direction
+    double d_vel_az = 0;    // Desired angular velocity to z direction(yaw angle)
 
     cap.open(-1);
 	if(!cap.isOpened()){
@@ -132,12 +160,6 @@ int main (int argc, char **argv){
         }
     }
 
-    for(int i=0; i<(WIDTH_V-1); i++){
-        for(int j=0; j<(HEIGHT_V-1); j++){
-            p1_v[i][j] = cvPoint(i,j);
-        }
-    }
-
     for(int i=0; i<(WIDTH_H-1); i++){
         for(int j=0; j<(HEIGHT_H-1); j++){
             p1_h[i][j].x = (p1_h[i][j].x*100)+100;
@@ -145,19 +167,18 @@ int main (int argc, char **argv){
         }
     }
 
-    for(int i=0; i<(WIDTH_V-1); i++){
-        for(int j=0; j<(HEIGHT_V-1); j++){
-            p1_v[i][j].x = (p1_v[i][j].x*100)+100;
-            p1_v[i][j].y = (p1_v[i][j].y*100)+100;
+    for(int i=0; i<(WIDTH_H); i++){
+        for(int j=0; j<(HEIGHT_H); j++){
+            r_x_h[i][j] = i-WIDTH_H/2+0.5;
+            r_y_h[i][j] = j-HEIGHT_H/2+0.5;
+            r_h[i][j] = sqrt(r_x_h[i][j]*r_x_h[i][j] + r_y_h[i][j]*r_y_h[i][j]);
         }
     }
 
     double count = 0;
-	while (ros::ok()){
+	while (1){
         mat_arrow_h.setTo(255);
-        mat_arrow_v.setTo(255);
         mat_original = Mat(O_HEIGHT, O_WIDTH, CV_8UC3, &Img_data);
-
 
         cap >> mat_original;
         if(mat_original.empty()){
@@ -174,12 +195,6 @@ int main (int argc, char **argv){
 		for(int i=0; i<(WIDTH_H); i++){
 			for(int j=0; j<(HEIGHT_H); j++){
 				arr_gray_prev_h[i][j] = arr_gray_curr_h[i][j];
-			}
-		}
-
-		for(int i=0; i<(WIDTH_V); i++){
-			for(int j=0; j<(HEIGHT_V); j++){
-				arr_gray_prev_v[i][j] = arr_gray_curr_v[i][j];
 			}
 		}
 
@@ -203,15 +218,9 @@ int main (int argc, char **argv){
             }
         }
 
-        for(int i=0; i<WIDTH_V; i++){
-            for(int j=0; j<HEIGHT_V; j++){
-                arr_gray_curr_v[i][j] = arr_gray_curr[WIDTH_V_O+i][j];
-            }
-        }
-
-		// ----------------------------------------- //
-		// -- Horizental Optical Flow Calculation -- //
-        // ----------------------------------------- //
+		// ---------------------------------------- //
+		// -- Horizental Optical Flow Estimation -- //
+        // ---------------------------------------- //
 
 		for(int i=0; i<(WIDTH_H-1); i++){
 			for(int j=0; j<(HEIGHT_H-1); j++){
@@ -235,31 +244,60 @@ int main (int argc, char **argv){
 		    }
 		}
 
-		// --------------------------------------- //
-		// -- Vertical Optical Flow Calculation -- //
-        // --------------------------------------- //
+        // -------------------------------------- //
+        // -- Obstacle Avoidance Guidance Rule -- //
+        // -------------------------------------- //
 
-		for(int i=0; i<(WIDTH_V-1); i++){
-			for(int j=0; j<(HEIGHT_V-1); j++){
-				Ix_v[i][j] = (arr_gray_prev_v[i+1][j] - arr_gray_prev_v[i][j] + arr_gray_prev_v[i+1][j+1] - arr_gray_prev_v[i][j+1] + arr_gray_curr_v[i+1][j] - arr_gray_curr_v[i][j] + arr_gray_curr_v[i+1][j+1] - arr_gray_curr_v[i][j+1])/4;
-				Iy_v[i][j] = (arr_gray_prev_v[i][j+1] - arr_gray_prev_v[i][j] + arr_gray_prev_v[i+1][j+1] - arr_gray_prev_v[i+1][j] + arr_gray_curr_v[i][j+1] - arr_gray_curr_v[i][j] + arr_gray_curr_v[i+1][j+1] - arr_gray_curr_v[i+1][j])/4;
-				It_v[i][j] = (arr_gray_curr_v[i][j] - arr_gray_prev_v[i][j] + arr_gray_curr_v[i+1][j] - arr_gray_prev_v[i+1][j] + arr_gray_curr_v[i][j+1] - arr_gray_prev_v[i][j+1] + arr_gray_curr_v[i+1][j+1] - arr_gray_prev_v[i+1][j+1])/4;
-			}
-		}
+        OFright = 0;
+        OFleft = 0;
 
-		for(int i=0; i<(WIDTH_V-2); i++){
-		    for(int j=0; j<(HEIGHT_V-2); j++){
-                mu_u_v[i][j] = (u_v[i][j+1] + u_v[i+1][j] + u_v[i+2][j+1] + u_v[i+1][j+2])/6 + (u_v[i][j] + u_v[i][j+2] + u_v[i+2][j] + u_v[i+2][j+2])/12;
-                mu_v_v[i][j] = (v_v[i][j+1] + v_v[i+1][j] + v_v[i+2][j+1] + v_v[i+1][j+2])/6 + (v_v[i][j] + v_v[i][j+2] + v_v[i+2][j] + v_v[i+2][j+2])/12;
+        for (int i=0; i<((WIDTH_H/2)-2); i++){
+            for(int j=0; j<(HEIGHT_H-2); j++){
+                OFleft = OFleft + sqrt(u_h[i][j]*u_h[i][j]);
+            }
+        }
+        for (int i=((WIDTH_H/2)); i<(WIDTH_H-2); i++){
+            for(int j=0; j<(HEIGHT_H-2); j++){
+                OFright = OFright + sqrt(u_h[i][j]*u_h[i][j]);
+            }
+        }
+
+        for(int i=0; i<(WIDTH_H); i++){
+		    for(int j=0; j<(HEIGHT_H); j++){
+                eta_h[i][j] = (r_x_h[i][j]*u_h[i][j] + r_y_h[i][j]*v_h[i][j])/((r_h[i][j])*(r_h[i][j]));
 		    }
 		}
 
-		for(int i=0; i<(WIDTH_V-2); i++){
-		    for(int j=0; j<(HEIGHT_V-2); j++){
-                u_v[i+1][j+1] = mu_u_v[i][j] - Ix_v[i][j]*((Ix_v[i][j]*mu_u_v[i][j] + Iy_v[i][j]*mu_v_v[i][j] + It_v[i][j])/(ALPHA*ALPHA + Ix_v[i][j]*Ix_v[i][j] + Iy_v[i][j]*Iy_v[i][j]));
-                v_v[i+1][j+1] = mu_v_v[i][j] - Iy_v[i][j]*((Ix_v[i][j]*mu_u_v[i][j] + Iy_v[i][j]*mu_v_v[i][j] + It_v[i][j])/(ALPHA*ALPHA + Ix_v[i][j]*Ix_v[i][j] + Iy_v[i][j]*Iy_v[i][j]));
-		    }
-		}
+        eta_h_l = 0;
+        eta_h_r = 0;
+        for (int i=0; i<((WIDTH_H/2)); i++){
+            for(int j=0; j<(HEIGHT_H); j++){
+                eta_h_l = eta_h_l + eta_h[i][j];
+            }
+        }
+        for (int i=((WIDTH_H/2)); i<(WIDTH_H); i++){
+            for(int j=0; j<(HEIGHT_H); j++){
+                eta_h_r = eta_h_r + eta_h[i][j];
+            }
+        }
+
+        of_rl_e = OFright - OFleft;
+        of_rl_e_f = LPF(of_rl_e_f, of_rl_e, CO_FRQ_RL);
+        of_rl_ctrl_input = PD_controller(of_rl_e_f, of_rl_e_f_p, RL_P_GAIN, RL_D_GAIN)*S_TIME;
+
+        eta_h_sum = eta_h_r + eta_h_l;
+        eta_h_sum_f = LPF(eta_h_sum_f, eta_h_sum, CO_FRQ_ETA);
+        eta_h_ctrl_input = PD_controller(eta_h_sum_f, eta_h_sum_f_p, ETA_P_GAIN, ETA_D_GAIN)*S_TIME;
+        eta_h_e = eta_h_r - eta_h_l;
+        eta_h_ctrl_signed_input = Sign(eta_h_e) * eta_h_ctrl_input;
+
+        sigmoid_eta = Sigmoid_fnc(SIGMA_M_ETA,SIGMA_C_ETA,eta_h_sum_f,-1);
+        sigmoid_rl = Sigmoid_fnc(SIGMA_M_RL,SIGMA_C_RL,eta_h_sum_f,1);
+
+        d_vel_lx = D_SET;
+        d_vel_ly = 0;
+        d_vel_lz = 0;
+        d_vel_az = (sigmoid_eta * eta_h_ctrl_signed_input) + (sigmoid_rl * of_rl_ctrl_input);
 
         // ------------- //
         // -- Display -- //
@@ -272,70 +310,60 @@ int main (int argc, char **argv){
             }
         }
 
-		for(int i=0; i<(WIDTH_V-1); i++){
-		    for(int j=0; j<(HEIGHT_V-1); j++){
-                p2_v[i][j].x = p1_v[i][j].x+(int)(u_v[i][j]*20);
-                p2_v[i][j].y = p1_v[i][j].y+(int)(v_v[i][j]*20);
-		    }
-		}
-
         for(int i=0; i<(WIDTH_H-1); i++){
             for(int j=0; j<(HEIGHT_H-1); j++){
                 arrowedLine(mat_arrow_h,p1_h[i][j],p2_h[i][j],0,3,CV_AA,0,1);
             }
         }
-
-		for(int i=0; i<(WIDTH_V-1); i++){
-		    for(int j=0; j<(HEIGHT_V-1); j++){
-                arrowedLine(mat_arrow_v,p1_v[i][j],p2_v[i][j],0,3,CV_AA,0,1);
-		    }
-		}
+        cout << "---------------------------" << endl;
+        cout << eta_h_ctrl_signed_input << endl;
+        cout << of_rl_ctrl_input << endl;
+        cout << d_vel_az <<endl;
 
 		namedWindow("Image_original",WINDOW_NORMAL);
 		imshow("Image_original",mat_original);
-        //namedWindow("Image_grey",WINDOW_NORMAL);
-		//imshow("Image_grey",mat_grey);
         namedWindow("Image_resized",WINDOW_NORMAL);
 		imshow("Image_resized",mat_resized);
 		namedWindow("Optical_flow_h",WINDOW_NORMAL);
 		imshow("Optical_flow_h",mat_arrow_h);
-		namedWindow("Optical_flow_v",WINDOW_NORMAL);
-		imshow("Optical_flow_v",mat_arrow_v);
-
-		// --------------- //
-        // -- Data Save -- //
-		// --------------- //
-
-        //// Image Data Save
-        file_image_data << count << ", ";
-        for(int i=0; i<(WIDTH); i++){
-		    for(int j=0; j<(HEIGHT); j++){
-                file_image_data << (int)arr_gray_curr[i][j] << ", ";
-		    }
-		}
-        file_image_data << endl;
 
 		keypressed = (char)waitKey(10);
 		if(keypressed == 27)
 			break;
-
-        fwmav_of_exp::MSG_NodeTime msg_node_time;
-
-		msg_node_time.data = count;
-
-		oa_of_pub.publish(msg_node_time);
-
-        ROS_INFO(" ");
-        ROS_INFO("-------------------------------");
-		ROS_INFO("Send msg = %f", count);
-		ROS_INFO("-------------------------------");
-
-        ros::spinOnce();
-        loop_rate.sleep();
-		count = count + S_TIME;
+        sleep(0.1);
 	}
 
-	file_image_data.close();
-
 	return 0;
+}
+
+double LPF(double y_p, double x_n, double tau){
+    double y_f = 0;
+    y_f = tau/(tau+S_TIME)*y_p + S_TIME/(tau+S_TIME)*x_n;
+    return y_f;
+}
+
+double Saturation(double val, double sat){
+    if(val>sat){
+        val = sat;
+    }
+    if(val<(-1*sat)){
+        val = -1*sat;
+    }
+    return val;
+}
+
+double Sign(double val){
+    return (val/abs(val));
+}
+
+double PD_controller(double &error_c, double &error_p, double P_gain, double D_gain){
+    double P_term = P_gain * error_c;
+    double D_term = D_gain * (error_c - error_p)/S_TIME;
+    error_p = error_c;
+    return (P_term + D_term);
+}
+
+double Sigmoid_fnc(double sigma_m, double sigma_c, double val, int sgn){
+    double sigmoid = 1/(1+exp(sgn*sigma_m*(val-sigma_c)));
+    return sigmoid;
 }
